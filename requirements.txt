@@ -1,0 +1,10 @@
+chipwhisperer==6.0.0
+configobj==5.0.9
+Cython==3.1.2
+ECPy==1.2.5
+fastdtw==0.3.4
+libusb1==3.3.1
+numpy==1.26.4
+pycryptodome==3.23.0
+pyserial==3.5
+tqdm==4.67.1
