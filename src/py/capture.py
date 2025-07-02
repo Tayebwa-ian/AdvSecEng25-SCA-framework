@@ -46,7 +46,7 @@ def _setup_cwlite_cw305_100t() -> tuple[cw.scopes.OpenADC, cw.targets.CW305]:
     # ...
     #
     target = cw.targets.CW305()
-    target._con(scope, bsfile="out/cw305.bit", force=False, fpga_id='100t')
+    target._con(scope, bsfile=r"C:\Users\Admin\Desktop\Security\advseceng25-sca-framework\out\cw305.bit", force=False, fpga_id='100t')
     target.vccint_set(1.0)
     #
     # Target-side clock generation
@@ -118,7 +118,7 @@ class DutIOTestPattern(DutIOPattern):
 
     def next(self) -> DutIO:
         return DutIO(
-            data=_cryptgen.randrange(stop=2**128),
+            data=_cryptgen.randrange(0, stop=2**128),
             key= self.key,
             computed_data=None)
 
@@ -173,10 +173,10 @@ def capture_trace(scope:cw.scopes.OpenADC, target:cw.targets.CW305, ktp:DutIOPat
         dut_computed_data = DutIO.format_read(target.fpga_read(DutIO.REG_DUT_DATAOUT, DutIO.DUT_DATAOUT_LEN_IN_BYTES))
         dut_io.computed_data = int.from_bytes(dut_computed_data)
         # Verify output
-        expected_out = aes_encrypt(data_in_bytes, key_in_bytes)['ciphertext']
-        print("This is the cipher text " + expected_out + " and the computed output is " + dut_io.computed_data)
+        expected_out = aes_encrypt(bytes(data_in_bytes), bytes(key_in_bytes))['ciphertext']
+        print("This is the cipher text " + expected_out.hex() + " and the computed output is " + str(dut_io.computed_data))
         if dut_io.computed_data != expected_out:
-            print(f"Output mismatch.\nExpected: {expected_out}\nActual: {dut_io.computed_data}")
+            print(f"Output mismatch.\nExpected: {expected_out.hex()}\nActual: {str(dut_io.computed_data)}")
         # Retrieve wave
         wave = scope.get_last_trace()
         if len(wave) == 0:
