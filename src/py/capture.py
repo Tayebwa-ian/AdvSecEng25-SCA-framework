@@ -213,7 +213,7 @@ if __name__ == "__main__":
     REPORT_INTERVAL = 500
     trace_writer = _create_trace_writer()
     # We capture 5000 traces for analysis
-    ktp:DutIOPattern = DutIOTestPattern(5000, 1, key=0x10a5_8869_d74b_e5a3_74cf_867c_fb47_3859)
+    ktp:DutIOPattern = DutIOTestPattern(5000, 3, key=0x10a5_8869_d74b_e5a3_74cf_867c_fb47_3859)
     try:
         scope, target = _setup_cwlite_cw305_100t()
         _lock_adc(scope)
