@@ -173,10 +173,11 @@ def capture_trace(scope:cw.scopes.OpenADC, target:cw.targets.CW305, ktp:DutIOPat
         dut_computed_data = DutIO.format_read(target.fpga_read(DutIO.REG_DUT_DATAOUT, DutIO.DUT_DATAOUT_LEN_IN_BYTES))
         dut_io.computed_data = int.from_bytes(dut_computed_data)
         # Verify output
-        expected_out = aes_encrypt(bytes(data_in_bytes), bytes(key_in_bytes))['ciphertext']
-        print("This is the cipher text " + expected_out.hex() + " and the computed output is " + str(dut_io.computed_data))
-        if dut_io.computed_data != expected_out:
-            print(f"Output mismatch.\nExpected: {expected_out.hex()}\nActual: {str(dut_io.computed_data)}")
+        expected_out = aes_encrypt(DutIO.format_write(data_in_bytes), DutIO.format_write(key_in_bytes))['ciphertext']
+        # convert from bytes to match with computed data
+        expected_data = int.from_bytes(expected_out)
+        if dut_io.computed_data != expected_data:
+            print(f"Output mismatch.\nExpected: {str(expected_data)}\nActual: {str(dut_io.computed_data)}")
         # Retrieve wave
         wave = scope.get_last_trace()
         if len(wave) == 0:
