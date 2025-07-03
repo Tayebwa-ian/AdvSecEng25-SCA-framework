@@ -129,6 +129,15 @@ aes_core U_aes_core (
    .data_o(dut_out),
    .busy_o(dut_busy)
 );
+//
+// Create done signal
+reg reg_dut_busy;
+//
+always @(posedge dut_clk_buf) begin
+   reg_dut_busy <= dut_busy;
+end
+//
+assign dut_done = !dut_busy && reg_dut_busy;
 
 endmodule
 
