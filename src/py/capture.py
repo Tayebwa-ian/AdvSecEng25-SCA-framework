@@ -46,7 +46,7 @@ def _setup_cwlite_cw305_100t() -> tuple[cw.scopes.OpenADC, cw.targets.CW305]:
     # ...
     #
     target = cw.targets.CW305()
-    target._con(scope, bsfile=r"C:\Users\Admin\Desktop\Security\advseceng25-sca-framework\out\cw305.bit", force=False, fpga_id='100t')
+    target._con(scope, bsfile=r"C:\Users\Admin\Desktop\Security\advseceng25-sca-framework\out\cw305.bit", force=False, fpga_id='100t', slurp=False)
     target.vccint_set(1.0)
     #
     # Target-side clock generation
@@ -90,11 +90,11 @@ class DutIO:
     @staticmethod
     def format_write(bytes:list[int]) -> bytearray:
         assert all(0 <= val <= 255 for val in bytes)
-        return bytearray(bytes)
+        return bytearray(bytes[::-1])
 
     @staticmethod
     def format_read(data:bytearray) -> list[int]:
-        return list(data)
+        return list(data[::-1])
 
 
 class DutIOPattern(ABC):
