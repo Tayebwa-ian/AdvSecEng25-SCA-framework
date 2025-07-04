@@ -173,7 +173,7 @@ def capture_trace(scope:cw.scopes.OpenADC, target:cw.targets.CW305, ktp:DutIOPat
         dut_computed_data = DutIO.format_read(target.fpga_read(DutIO.REG_DUT_DATAOUT, DutIO.DUT_DATAOUT_LEN_IN_BYTES))
         dut_io.computed_data = int.from_bytes(dut_computed_data)
         # Verify output
-        expected_out = aes_encrypt(DutIO.format_write(data_in_bytes), DutIO.format_write(key_in_bytes))['ciphertext']
+        expected_out = aes_encrypt(bytearray(data_in_bytes), bytearray(key_in_bytes))['ciphertext']
         # convert from bytes to match with computed data
         expected_data = int.from_bytes(expected_out)
         if dut_io.computed_data != expected_data:
@@ -213,7 +213,7 @@ if __name__ == "__main__":
     REPORT_INTERVAL = 500
     trace_writer = _create_trace_writer()
     # We capture 5000 traces for analysis
-    ktp:DutIOPattern = DutIOTestPattern(5000, 3, key=0x10a5_8869_d74b_e5a3_74cf_867c_fb47_3859)
+    ktp:DutIOPattern = DutIOTestPattern(1, 1, key=0x10a5_8869_d74b_e5a3_74cf_867c_fb47_3859)
     try:
         scope, target = _setup_cwlite_cw305_100t()
         _lock_adc(scope)
