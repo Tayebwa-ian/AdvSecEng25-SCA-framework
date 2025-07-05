@@ -17,12 +17,12 @@ def _setup_cwlite_cw305_100t() -> tuple[cw.scopes.OpenADC, cw.targets.CW305]:
     scope = cw.scopes.OpenADC()
     scope.con(idProduct=0xace2, prog_speed=int(10E6))
     # Gain
-    scope.gain.db = 20 # low-noise amplifier gain, [-6.5, 56] dB
+    scope.gain.db = 30 # low-noise amplifier gain, [-6.5, 56] dB
     # ADC
     scope.adc.basic_mode = "rising_edge" # trigger settings
     scope.adc.offset = 0
-    scope.adc.presamples = 0
-    scope.adc.samples = 150
+    scope.adc.presamples = 20
+    scope.adc.samples = 200
     #scope.adc.decimate  # Downsample facpture
     #fifo_fill_mode  # Buffer fill strategy
     #scope.adc.timeout  # Capture timeout
@@ -188,7 +188,7 @@ def capture_trace(scope:cw.scopes.OpenADC, target:cw.targets.CW305, ktp:DutIOPat
 
 
 def _create_trace_writer():
-    STORE_PATH = "data"
+    STORE_PATH = "src/py/data"
     TRACES_PER_FILE = 100000
     #
     file_counter = 0
@@ -213,14 +213,13 @@ if __name__ == "__main__":
     REPORT_INTERVAL = 500
     trace_writer = _create_trace_writer()
     # We capture 5000 traces for analysis
-    ktp:DutIOPattern = DutIOTestPattern(1, 1, key=0x10a5_8869_d74b_e5a3_74cf_867c_fb47_3859)
+    ktp:DutIOPattern = DutIOTestPattern(10000, 1, key=0x10a5_8869_d74b_e5a3_74cf_867c_fb47_3859)
     try:
         scope, target = _setup_cwlite_cw305_100t()
         _lock_adc(scope)
         trigger_counts = set()
         for i_capture in range(ktp.N_traces):
-            if not i_capture % REPORT_INTERVAL:
-                print(f"Captured {i_capture}/{ktp.N_traces} traces.")
+            print(f"Captured {i_capture}/{ktp.N_traces} traces.")
             trace = capture_trace(scope, target, ktp)
             trace_writer(trace, i_capture==ktp.N_traces-1)
             trigger_counts.add(trace.trig_count)
