@@ -83,9 +83,9 @@ class DutIO:
 
     BYTECNT_SIZE = 7
 
-    data:int
+    data:bytearray
     key:int
-    computed_data:int
+    computed_data:bytearray
 
     @staticmethod
     def format_write(bytes:list[int]) -> bytearray:
@@ -118,7 +118,7 @@ class DutIOTestPattern(DutIOPattern):
 
     def next(self) -> DutIO:
         return DutIO(
-            data=_cryptgen.randrange(0, stop=2**128),
+            data=bytearray(_cryptgen.randrange(0, stop=2*128)for _ in range(16)),
             key= self.key,
             computed_data=None)
 
@@ -159,7 +159,7 @@ def capture_trace(scope:cw.scopes.OpenADC, target:cw.targets.CW305, ktp:DutIOPat
 
     for i_rep in range(ktp.average_over):
         # Write Inputs
-        data_in_bytes = list(dut_io.data.to_bytes(DutIO.DUT_DATAIN_LEN_IN_BYTES))
+        data_in_bytes = list(dut_io.data)
         key_in_bytes = list(dut_io.key.to_bytes(DutIO.DUT_KEYIN_LEN_IN_BYTES))
         target.fpga_write(DutIO.REG_DUT_DATAIN, DutIO.format_write(data_in_bytes))
         target.fpga_write(DutIO.REG_DUT_KEYIN, DutIO.format_write(key_in_bytes))
@@ -171,12 +171,13 @@ def capture_trace(scope:cw.scopes.OpenADC, target:cw.targets.CW305, ktp:DutIOPat
             raise Exception("Target did not report done in time.")
         # Retrieve results
         dut_computed_data = DutIO.format_read(target.fpga_read(DutIO.REG_DUT_DATAOUT, DutIO.DUT_DATAOUT_LEN_IN_BYTES))
-        dut_io.computed_data = int.from_bytes(dut_computed_data)
+        dut_io.computed_data = dut_computed_data
+        FPGA_data = int.from_bytes(dut_computed_data)
         # Verify output
         expected_out = aes_encrypt(bytearray(data_in_bytes), bytearray(key_in_bytes))['ciphertext']
         # convert from bytes to match with computed data
         expected_data = int.from_bytes(expected_out)
-        if dut_io.computed_data != expected_data:
+        if FPGA_data != expected_data:
             print(f"Output mismatch.\nExpected: {str(expected_data)}\nActual: {str(dut_io.computed_data)}")
         # Retrieve wave
         wave = scope.get_last_trace()
@@ -191,7 +192,7 @@ def _create_trace_writer():
     STORE_PATH = "src/py/data"
     TRACES_PER_FILE = 100000
     #
-    file_counter = 0
+    file_counter = 1
     trace_batch:list[TraceExt] = []
     os.makedirs(STORE_PATH, exist_ok=True)
     #
@@ -213,7 +214,7 @@ if __name__ == "__main__":
     REPORT_INTERVAL = 500
     trace_writer = _create_trace_writer()
     # We capture 5000 traces for analysis
-    ktp:DutIOPattern = DutIOTestPattern(10000, 1, key=0x10a5_8869_d74b_e5a3_74cf_867c_fb47_3859)
+    ktp:DutIOPattern = DutIOTestPattern(2000, 1, key=0x10a5_8869_d74b_e5a3_74cf_867c_fb47_3859)
     try:
         scope, target = _setup_cwlite_cw305_100t()
         _lock_adc(scope)

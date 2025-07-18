@@ -1,0 +1,10 @@
+[Trace Management]
+tracefile0 = CW_305_data\traces\config_2025.07.17-15.07.08_0.cfg
+enabled0 = True
+[ChipWhisperer]
+[[General Settings]]
+Project Name = Untitled
+Project File Version = 1.00
+Project Author = Unknown
+Program Name = ChipWhisperer
+Program Version = ""
