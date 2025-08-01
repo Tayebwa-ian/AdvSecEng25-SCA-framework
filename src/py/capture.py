@@ -192,7 +192,7 @@ def _create_trace_writer():
     STORE_PATH = "src/py/data"
     TRACES_PER_FILE = 100000
     #
-    file_counter = 1
+    file_counter = 3
     trace_batch:list[TraceExt] = []
     os.makedirs(STORE_PATH, exist_ok=True)
     #
@@ -214,7 +214,7 @@ if __name__ == "__main__":
     REPORT_INTERVAL = 500
     trace_writer = _create_trace_writer()
     # We capture 5000 traces for analysis
-    ktp:DutIOPattern = DutIOTestPattern(2000, 1, key=0x10a5_8869_d74b_e5a3_74cf_867c_fb47_3859)
+    ktp:DutIOPattern = DutIOTestPattern(1000, 1, key=0x10a5_8869_d74b_e5a3_74cf_867c_fb47_3859)
     try:
         scope, target = _setup_cwlite_cw305_100t()
         _lock_adc(scope)
