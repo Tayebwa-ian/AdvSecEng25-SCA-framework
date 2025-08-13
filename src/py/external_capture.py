@@ -1,539 +1,491 @@
 """
-CW305 (standalone) + Rigol MSO5074 segmented capture
-----------------------------------------------------
+CW305 (standalone) + Rigol MSO5074 capture (One-Trace-at-a-Time Mode for SCA)
+-----------------------------------------------------------------------------
 
 Purpose
 -------
-Run AES-128 encryptions on a CW305 FPGA board and capture aligned power traces
-with a Rigol MSO5074 oscilloscope. No ChipWhisperer scope is used — the Rigol
-does all waveform acquisition.
+Run AES-128 encryptions on a CW305 FPGA board and capture independent traces
+(one per plaintext) with a Rigol MSO5074 oscilloscope. Each scope acquisition
+is fully independent to avoid any influence from previous traces.
 
-Triggering
-----------
-1) Digital trigger (recommended):
-   - Export a trigger pin from your AES design (asserted during encryption).
-   - Wire that pin to Rigol CHAN2 (or EXT), set TRIGGER_MODE = "digital".
+This implementation includes robust scope arming and diagnostic features:
+- Configurable arming delay (SCOPE_ARM_DELAY) after :SING.
+- Clears acquisition state (:STOP + :SING) before every trace.
+- Uses *OPC? to ensure the scope processed :SING before polling status.
+- Polls multiple possible trigger-status tokens (e.g. 'WAIT', 'ARM', 'READY').
+- Retries arming several times and provides an option to skip traces on failure.
 
-2) Power trigger (fallback):
-   - Trigger directly on the power spike on CHAN1.
-   - Set TRIGGER_MODE = "power".
+Notes
+-----
+- The script expects a Rigol MSO5xxx that supports the SCPI commands used
+  (common for Rigol MSO5000 series). Minor firmware differences may require
+  changing accepted trigger-status tokens or query commands.
+- If you see unexpected trigger-status strings in debug logs, add them to
+  _ACCEPTED_ARMED_STATES.
 
-Wiring
-------
-- Measure power across the shunt (CW305) → Rigol CHAN1 (coax or diff probe).
-- Trigger pin from CW305 → Rigol CHAN2 (or EXT) if using digital trigger.
-- Common ground between CW305 and Rigol.
-
-Requirements
-------------
-- Python packages: chipwhisperer, pyvisa, numpy
-- Rigol VISA connection (NI-VISA or pyvisa-py + WinUSB)
-- A working CW305 bitstream that exposes AES control registers used here.
-
-Outputs
--------
-Saves a compressed .npz containing:
-- waves: np.float32 array (N_TRACES x POINTS_PER_SEGMENT or averaged)
-- plaintexts, keys, ciphertexts: uint8 arrays for each logical trace
-- rigol / cw305 / meta dicts with capture configuration
 """
 
 import os
 import time
 from dataclasses import dataclass
 from random import SystemRandom
+from typing import Literal
 
 import numpy as np
 import pyvisa
 import chipwhisperer as cw
 
-# =========================
 # User Configuration
-# =========================
 
-# Capture plan
-N_TRACES = 5000            # number of logical traces saved
-AVERAGE_OVER = 1           # segments per logical trace; averaged in software if >1
+# Total number of traces to capture
+N_TRACES = 2000
 
-# Trigger mode: "digital" (use CHAN2/EXT) or "power" (trigger on CHAN1 power)
-TRIGGER_MODE = "digital"   # "digital" or "power"
+# Acquisition mode: 'AVERAGE' (hardware averages), 'HRES' (high-res), or
+# 'NORMAL' (single-shot). AVERAGE will use HARDWARE_AVERAGES.
+ACQUISITION_MODE: Literal['AVERAGE', 'HRES', 'NORMAL'] = 'AVERAGE'
+HARDWARE_AVERAGES = 16
 
-# Rigol channels & scales
-MEAS_CH = "CHAN1"          # analog measurement channel (power)
-TRIG_SRC = "CHAN2"         # "CHAN2" or "EXT" for digital; overridden to "CHAN1" if TRIGGER_MODE="power"
-TRIG_LEVEL_V = 1.5         # digital trigger level — adjust to your FPGA IO level
+# Bandwidth limit in MHz, or None to leave bandwidth off
+BANDWIDTH_LIMIT_MHZ: int | None = 20
 
-# Timebase & vertical (tune for your setup)
-POINTS_PER_SEGMENT = 500   # memory depth per segment (ACQ:MDEP)
-TIME_PER_DIV = 2e-6        # sec/div; widen if missing triggers, narrow for more resolution
-VERTICAL_SCALE_V = 0.05    # volts/div on MEAS_CH; tune so the power waveform fits vertically
+# Triggering configuration (digital or analog)
+TRIGGER_MODE = "digital"  # 'digital' means TRIG_SRC is a digital input
+MEAS_CH = "CHAN1"         # analog channel to record
+TRIG_SRC = "CHAN2"        # trigger source (digital input or channel)
 
-# CW305 bitstream path (your provided path)
+# Vertical/time settings for the analog channel we're recording
+VERTICAL_SCALE_V = 0.05
+TIME_PER_DIV = 2e-6
+TRIG_LEVEL_V = 1.5
+POINTS_PER_TRACE = 500
+
+# Force a specific VISA resource (e.g. 'USB0::0x1AB1::0x0588::DS1ZA170600000::INSTR')
+RIGOL_VISA_FORCE = None
+
+# FPGA bitstream and output save path
 BITSTREAM = r"C:\Users\Admin\Desktop\Security\advseceng25-sca-framework\out\cw305.bit"
-
-# Save path (your provided path)
 SAVE_PATH = r"C:\Users\Admin\Desktop\Security\advseceng25-sca-framework\src\py\data\traces_mso5074_1.npz"
-
-# Optional: hardcode the VISA resource for the Rigol (USB or LAN). Set to None to auto-detect.
-RIGOL_VISA_FORCE = None    # e.g. "USB0::0x1AB1::0x04CE::MS5A12345678::INSTR"
-
-# Optional: fixed AES-128 key used for all traces (hex string)
 FIXED_KEY_HEX = "10A58869D74BE5A374CF867CFB473859"
 
-# Small safety delays
-SCOPE_ARM_DELAY = 0.25     # seconds to wait after arming scope before first trigger
-POST_TRIGGER_DELAY = 0.001 # small pause after each encryption to help re-arm
+# ----------------------------
+# Scope arming configuration
+# ----------------------------
+# Delay after the scope receives ':SING' before we issue the FPGA 'GO' trigger.
+# Many scopes take a short time to arm and settle; tune this if needed.
+SCOPE_ARM_DELAY = 0.05  # seconds; set to 0 to skip fixed delay
 
-# Readback timeout (ms). Increase if transfers are slow.
-RIGOL_READ_TIMEOUT_MS = 120000  # 120 seconds
+# Maximum time to wait for scope to enter an 'armed' state (per attempt)
+SCOPE_ARM_TIMEOUT = 1.0  # seconds
 
-# Maximum attempts to read a segment before giving up (will return NaN-filled array on fail)
-MAX_SEGMENT_READ_ATTEMPTS = 2
+# How many times to try the :SING -> poll sequence before giving up
+SCOPE_ARM_RETRIES = 3
 
-# =========================
-# Internal Helpers
-# =========================
+# Behavior if scope fails to arm after retries: skip trace or abort
+SKIP_ON_ARM_FAIL = True
 
-_rng = SystemRandom()
+# Accept a set of possible 'armed' status tokens returned by :TRIG:STAT?
+# Common tokens include 'WAIT', but firmware can differ; add tokens you
+# observe in the debug output if necessary.
+_ACCEPTED_ARMED_STATES = ('WAIT', 'ARM', 'READY', 'SINGLE', 'TRIG')
 
+# Small delay after trigger completes before reading waveform (some scopes)
+POST_TRIGGER_DELAY = 0.001
+
+# Rigol MSO5000 control helper
+class RigolScope:
+    """Rigol MSO5xxx control wrapper.
+
+    Provides connect/configure/arm/read helpers and handles some
+    firmware quirks (different :TRIG:STAT? strings, need for *OPC?).
+    """
+
+    def __init__(self, visa_resource: str | None = None):
+        self.visa_resource = visa_resource
+        self.rm = None
+        self.inst = None
+
+    def connect(self):
+        """Connect to the oscilloscope via pyvisa.
+
+        If no visa_resource is provided, auto-discovery looks for a device
+        whose *IDN? contains 'RIGOL' and 'MSO5'.
+        """
+        if not self.visa_resource:
+            self.visa_resource = self._find_device()
+        print(f"[INFO] Connecting to Rigol at: {self.visa_resource}")
+        self.rm = pyvisa.ResourceManager()
+        self.inst = self.rm.open_resource(self.visa_resource)
+        # Increase timeout to tolerate long operations (binary transfers, etc.)
+        self.inst.timeout = 30000
+        try:
+            # allow larger binary transfers if supported by backend
+            self.inst.chunk_size = 1024 * 1024
+        except Exception:
+            pass
+        print(f"[INFO] Connected: {self.inst.query('*IDN?').strip()}")
+
+    def _find_device(self, hint: str = "MSO5") -> str:
+        """Scan VISA resources and return the first Rigol MSO5 device found."""
+        rm = pyvisa.ResourceManager()
+        for res in rm.list_resources():
+            try:
+                inst = rm.open_resource(res, open_timeout=2000)
+                idn = inst.query("*IDN?").strip()
+                inst.close()
+                if "RIGOL" in idn and hint in idn:
+                    return res
+            except Exception:
+                pass
+        raise RuntimeError("Rigol scope not found. Provide RIGOL_VISA_FORCE to override.")
+
+    def setup_for_single_trace(self):
+        """Configure scope for one-trace capture.
+
+        This function resets the instrument, configures acquisition type,
+        channel scaling and trigger. It places the scope in STOP so callers
+        can explicitly arm it prior to each trace.
+        """
+        # Reset instrument state and stop any running acquisitions
+        self.inst.write("*RST")
+        self.inst.write(":STOP")
+
+        # Acquisition mode selection
+        if ACQUISITION_MODE == 'AVERAGE':
+            self.inst.write(":ACQ:TYPE AVER")
+            self.inst.write(f":ACQ:COUN {HARDWARE_AVERAGES}")
+        elif ACQUISITION_MODE == 'HRES':
+            self.inst.write(":ACQ:TYPE NORM")
+            self.inst.write(":ACQ:MODE HRES")
+        else:
+            self.inst.write(":ACQ:TYPE NORM")
+            self.inst.write(":ACQ:MODE NORM")
+
+        # Memory depth and points per trace
+        self.inst.write(f":ACQ:MDEP {POINTS_PER_TRACE}")
+
+        # Channel setup (display, coupling, probe factor, vertical scale)
+        self.inst.write(f":{MEAS_CH}:DISP ON")
+        self.inst.write(f":{MEAS_CH}:COUP DC")
+        self.inst.write(f":{MEAS_CH}:PROB 1")
+        self.inst.write(f":{MEAS_CH}:SCAL {VERTICAL_SCALE_V}")
+
+        # Bandwidth limit (optional)
+        if BANDWIDTH_LIMIT_MHZ:
+            self.inst.write(f":{MEAS_CH}:BWL {BANDWIDTH_LIMIT_MHZ}M")
+        else:
+            self.inst.write(f":{MEAS_CH}:BWL OFF")
+
+        # Timebase
+        self.inst.write(":TIM:MODE MAIN")
+        self.inst.write(f":TIM:SCAL {TIME_PER_DIV}")
+
+        # Trigger setup
+        trig_src = TRIG_SRC if TRIGGER_MODE == "digital" else MEAS_CH
+        trig_lvl = TRIG_LEVEL_V if TRIGGER_MODE == "digital" else 0.01
+        self.inst.write(":TRIG:MODE EDGE")
+        self.inst.write(f":TRIG:EDGE:SOUR {trig_src}")
+        self.inst.write(":TRIG:EDGE:SLOP POS")
+        self.inst.write(f":TRIG:LEV {trig_lvl}")
+
+        # Waveform transfer configuration
+        self.inst.write(":WAV:SOUR " + MEAS_CH)
+        self.inst.write(":WAV:MODE NORM")
+        self.inst.write(":WAV:FORM BYTE")
+
+    # Trigger / arming helpers
+    def query_trigger_status(self) -> str:
+        """Query the instrument trigger status string.
+
+        Some firmwares support ':TRIG:STAT?' while others might expose
+        slightly different variants. We try multiple possible queries and
+        return the first non-empty normalized string.
+        """
+        candidates = [":TRIG:STAT?", ":TRIGGER:STATUS?", ":TRIGger:STAT?"]
+        for q in candidates:
+            try:
+                stat = self.inst.query(q).strip()
+                if stat:
+                    return stat.upper()
+            except Exception:
+                # Ignore and try the next candidate
+                pass
+        # If none responded, return an empty string
+        return ""
+
+    def clear_and_arm(self, delay_after_sing: float = SCOPE_ARM_DELAY, timeout: float | None = None) -> bool:
+        """Stop previous acquisition, issue :SING and wait for the scope to
+        enter an accepted 'armed' state. Returns True if armed within the
+        configured timeout and retries; False otherwise.
+
+        Steps:
+        1. Write ':STOP' to clear previous acquisitions.
+        2. Write ':SING' to request a single acquisition.
+        3. Block on '*OPC?' (if supported) so the scope processes commands.
+        4. Wait fixed delay (delay_after_sing) to give hardware a moment.
+        5. Poll ':TRIG:STAT?' until an accepted armed token appears or timeout.
+        6. Retry the entire sequence up to SCOPE_ARM_RETRIES times.
+        """
+        if timeout is None:
+            timeout = SCOPE_ARM_TIMEOUT
+
+        # Ensure a clean starting point
+        try:
+            self.inst.write(":STOP")
+        except Exception:
+            pass
+
+        for attempt in range(1, SCOPE_ARM_RETRIES + 1):
+            try:
+                # Request a single acquisition
+                self.inst.write(":SING")
+
+                # Block until the instrument has processed queued commands.
+                # Some firmwares honor '*OPC?' and it returns '1' when all
+                # operations are complete. If it fails, we fall back to a
+                # small sleep below.
+                try:
+                    self.inst.query("*OPC?")
+                except Exception:
+                    # *OPC? may not be supported by all firmwares or may
+                    # time out; nonetheless continue after a short delay.
+                    pass
+
+                # Allow a short fixed delay for hardware to settle
+                if delay_after_sing > 0:
+                    time.sleep(delay_after_sing)
+
+                # Poll for an 'armed' state until timeout
+                start = time.time()
+                while (time.time() - start) < timeout:
+                    st = self.query_trigger_status()
+                    if any(tok in st for tok in _ACCEPTED_ARMED_STATES):
+                        return True
+                    time.sleep(0.02)
+
+            except Exception as e:
+                # Log exception and retry after a short backoff
+                print(f"[WARN] Exception while trying to arm (attempt {attempt}): {e}")
+                time.sleep(0.05)
+
+        # If we exhausted retries and never saw an accepted 'armed' state
+        return False
+
+    # Acquisition helpers
+
+    def wait_for_trace(self):
+        """Block until the oscilloscope reports the previously requested
+        operations are complete. Uses '*OPC?' which typically returns '1'
+        once the device has finished processing queued commands.
+        """
+        try:
+            self.inst.query("*OPC?")
+        except Exception:
+            # If query fails, continue; the caller may still attempt to read
+            # the waveform, which will raise if no data is present.
+            pass
+
+    def read_single_trace(self) -> np.ndarray:
+        """Read the last acquired waveform as a numpy array of voltages.
+
+        The Rigol waveform binary transfer uses YINC/YOR/YREF to map bytes
+        to voltages. We convert accordingly and return a float32 array.
+        """
+        y_inc = float(self.inst.query(':WAV:YINC?'))
+        y_org = float(self.inst.query(':WAV:YOR?'))
+        y_ref = float(self.inst.query(':WAV:YREF?'))
+        raw = self.inst.query_binary_values(':WAV:DATA?', datatype='B', container=np.array)
+        return (raw.astype(np.float32) - y_ref) * y_inc + y_org
+
+    def disconnect(self):
+        """Return the scope to RUN (if possible) and close VISA resources."""
+        if self.inst:
+            try:
+                self.inst.write(":RUN")
+                self.inst.close()
+            except Exception:
+                pass
+        if self.rm:
+            try:
+                self.rm.close()
+            except Exception:
+                pass
+
+# CW305 Helpers
 @dataclass
 class TraceMeta:
-    """Holds metadata for each logical trace."""
+    """Simple container for trace metadata."""
     pt: bytes
     key: bytes
     ct: bytes
 
+_rng = SystemRandom()
+
+
 def make_plaintexts(n: int) -> list[bytes]:
-    """Generate n random 16-byte plaintexts."""
+    """Generate `n` random 16-byte plaintexts using a secure RNG.
+
+    Returns a list of bytes objects, each 16 bytes long.
+    """
     return [bytes(_rng.getrandbits(8) for _ in range(16)) for _ in range(n)]
 
-# ---------------------------
-# Rigol MSO5000 helpers
-# ---------------------------
 
-def find_rigol(scope_hint: str = "MSO5") -> str:
+def setup_cw305():
+    """Initialize and configure the CW305 target board.
+
+    - Connects to the CW305 target provided by chipwhisperer.
+    - Programs the provided bitstream (unless already loaded).
+    - Sets VCCINT, PLL, and other tiny target-specific values.
+
+    Returns the initialized target object.
     """
-    Auto-detect a Rigol MSO5000 via VISA by querying *IDN?.
-    Tries system backend first, then the pure-Python backend (@py).
-    Returns a VISA resource string.
-    Raises RuntimeError if none found.
-    """
-    def _scan(rm) -> list[tuple[str, str]]:
-        hits = []
-        try:
-            resources = rm.list_resources()
-        except Exception:
-            resources = []
-        for r in resources:
-            try:
-                inst = rm.open_resource(r)
-                inst.timeout = 2000
-                idn = inst.query("*IDN?").strip()
-                inst.close()
-            except Exception:
-                continue
-            if "RIGOL" in idn.upper() and scope_hint.upper() in idn.upper():
-                hits.append((r, idn))
-        return hits
-
-    # Try system backend (e.g., NI-VISA)
-    try:
-        rm0 = pyvisa.ResourceManager()
-        hits0 = _scan(rm0)
-        if hits0:
-            print(f"[INFO] Found Rigol devices (system backend): {hits0}")
-            return hits0[0][0]
-    except Exception:
-        pass
-
-    # Try pure Python backend (@py)
-    try:
-        rm1 = pyvisa.ResourceManager("@py")
-        hits1 = _scan(rm1)
-        if hits1:
-            print(f"[INFO] Found Rigol devices (pyvisa-py): {hits1}")
-            return hits1[0][0]
-    except Exception:
-        pass
-
-    raise RuntimeError("Rigol scope not found via VISA. Check drivers/cables or set RIGOL_VISA_FORCE.")
-
-def setup_rigol_segmode(total_segments: int, visa_override: str | None = None):
-    """
-    Configure the Rigol MSO5074 for segmented acquisition.
-    Returns (rm, inst) where inst is an open pyvisa instrument.
-    """
-    visa_str = visa_override or find_rigol("MSO5")
-    rm = pyvisa.ResourceManager()
-    inst = rm.open_resource(visa_str)
-    # Increase chunk size if available (some backends support)
-    try:
-        inst.chunk_size = 1024 * 64
-    except Exception:
-        pass
-    inst.timeout = 30000  # ms
-
-    # Reset and stop acquisition
-    inst.write("*RST")
-    inst.write(":STOP")
-
-    # Measurement channel setup
-    inst.write(f":{MEAS_CH}:DISP ON")
-    inst.write(f":{MEAS_CH}:COUP DC")
-    inst.write(f":{MEAS_CH}:PROB 1")
-    inst.write(f":{MEAS_CH}:SCAL {VERTICAL_SCALE_V}")
-
-    # Timebase
-    inst.write(":TIM:MODE MAIN")
-    inst.write(f":TIM:SCAL {TIME_PER_DIV}")
-
-    # Segmented acquisition
-    inst.write(":ACQ:MODE SEGM")
-    inst.write(f":ACQ:MDEP {POINTS_PER_SEGMENT}")
-    inst.write(f":ACQ:SEGM:COUN {total_segments}")
-
-    # Trigger configuration
-    if TRIGGER_MODE.lower() == "power":
-        inst.write(":TRIG:MODE EDGE")
-        inst.write(f":TRIG:EDGE:SOUR {MEAS_CH}")
-        inst.write(":TRIG:EDGE:SLOP POS")
-        inst.write(":TRIG:LEV 0.01")
-    else:
-        inst.write(":TRIG:MODE EDGE")
-        inst.write(f":TRIG:EDGE:SOUR {TRIG_SRC}")
-        inst.write(":TRIG:EDGE:SLOP POS")
-        inst.write(f":TRIG:LEV {TRIG_LEVEL_V}")
-
-    # Waveform readback settings
-    inst.write(":WAV:FORM BYTE")
-    inst.write(":WAV:MODE NORM")
-    try:
-        inst.write(":WAV:POIN:MODE RAW")
-    except Exception:
-        # some firmwares may not support
-        pass
-    inst.write(f":WAV:SOUR {MEAS_CH}")
-
-    # Arm segmented capture (Single sequence)
-    inst.write(":SING")
-    time.sleep(0.05)
-    return rm, inst
-
-def rigol_select_segment(inst, seg_index: int):
-    """
-    Select the segment index on the Rigol and return the integer segment number used.
-    Note: some firmwares expect 1-based indices, others 0-based. We'll use the provided index.
-    """
-    inst.write(f":WAV:SEGM {seg_index}")
-    return seg_index
-
-def rigol_get_points_for_selected_segment(inst) -> int | None:
-    """
-    Query how many points the selected segment will return.
-    Returns int number of points, or None if the query fails.
-    """
-    try:
-        # :WAV:POIN? is common; return can be float-like string so cast via float then int
-        pts = inst.query(":WAV:POIN?")
-        return int(float(pts))
-    except Exception:
-        try:
-            pts = inst.query(":ACQ:MDEP?")
-            return int(float(pts))
-        except Exception:
-            return None
-
-def rigol_read_segment(inst, seg_index: int) -> np.ndarray:
-    """
-    Robust reading of one segment from the Rigol as calibrated volts (float32).
-    - Selects the segment, queries :WAV:POIN? for expected points.
-    - Temporarily increases timeout to RIGOL_READ_TIMEOUT_MS while reading binary data.
-    - Retries up to MAX_SEGMENT_READ_ATTEMPTS times on VisaIOError.
-    - If unable to read, returns a NaN-filled array of length POINTS_PER_SEGMENT.
-    """
-    # Select segment
-    rigol_select_segment(inst, seg_index)
-
-    # Query expected points
-    n_points = rigol_get_points_for_selected_segment(inst)
-    if n_points is None:
-        n_points = POINTS_PER_SEGMENT  # fallback
-    if n_points == 0:
-        # Segment is empty — return NaNs (but warn)
-        print(f"[WARN] Segment {seg_index} reports 0 points; returning NaN array.")
-        return np.full((POINTS_PER_SEGMENT,), np.nan, dtype=np.float32)
-
-    # Get scaling parameters (per-segment)
-    try:
-        yinc = float(inst.query(":WAV:YINC?"))
-        yref = float(inst.query(":WAV:YREF?"))
-        yor  = float(inst.query(":WAV:YOR?"))
-    except Exception as e:
-        # If queries fail, set safe defaults (will result in raw counts)
-        print(f"[WARN] Failed to query YINC/YREF/YOR for segment {seg_index}: {e}")
-        yinc, yref, yor = 1.0, 128.0, 0.0
-
-    prev_timeout = getattr(inst, "timeout", 30000)
-    # Set a long timeout for large transfers
-    inst.timeout = max(prev_timeout, RIGOL_READ_TIMEOUT_MS)
-
-    last_err = None
-    for attempt in range(1, MAX_SEGMENT_READ_ATTEMPTS + 1):
-        try:
-            # Read raw binary block as unsigned bytes
-            raw = np.array(
-                inst.query_binary_values(":WAV:DATA?", datatype='B', container=np.array),
-                dtype=np.float32
-            )
-            if raw.size == 0:
-                # Empty read — warn & retry
-                print(f"[WARN] Read returned 0 bytes for segment {seg_index} (attempt {attempt}/{MAX_SEGMENT_READ_ATTEMPTS}).")
-                last_err = RuntimeError("Empty read")
-                time.sleep(0.1)
-                continue
-
-            # If we got fewer points than expected, still proceed but warn
-            if raw.size != n_points:
-                print(f"[WARN] Segment {seg_index}: expected {n_points} points, got {raw.size} bytes.")
-
-            volts = (raw - yref) * yinc + yor
-            return volts.astype(np.float32)
-
-        except pyvisa.errors.VisaIOError as e:
-            last_err = e
-            print(f"[ERROR] VisaIOError reading segment {seg_index} (attempt {attempt}/{MAX_SEGMENT_READ_ATTEMPTS}): {e}")
-            time.sleep(0.2)
-            continue
-        except Exception as e:
-            last_err = e
-            print(f"[ERROR] Unexpected error reading segment {seg_index} (attempt {attempt}/{MAX_SEGMENT_READ_ATTEMPTS}): {e}")
-            time.sleep(0.2)
-            continue
-        finally:
-            # restore timeout only after final attempt or return
-            inst.timeout = prev_timeout
-
-    # If we reach here, all attempts failed — return NaNs so the capture can complete
-    print(f"[ERROR] Failed to read segment {seg_index} after {MAX_SEGMENT_READ_ATTEMPTS} attempts. Returning NaN array.")
-    return np.full((POINTS_PER_SEGMENT,), np.nan, dtype=np.float32)
-
-# ---------------------------
-# CW305 (standalone) helpers
-# ---------------------------
-
-def setup_cw305_standalone():
-    """
-    Connect to the CW305 target over USB only (no OpenADC),
-    program the bitstream, set the core voltage and PLL.
-    Also performs a core reset and sets bytecount size.
-    """
+    print("[INFO] Initializing CW305...")
     t = cw.targets.CW305()
-    # Prefer modern API; fall back if older CW version
-    try:
-        t.con(bsfile=BITSTREAM, force=False, fpga_id='100t', slurp=False)
-    except Exception:
-        t._con(scope=None, bsfile=BITSTREAM, force=False, fpga_id='100t', slurp=False)
-
-    # Core voltage and clocking
+    # Program the FPGA if necessary. Set force=True to always reprogram.
+    t.con(bsfile=BITSTREAM, force=False, fpga_id='100t')
     t.vccint_set(1.0)
-
     t.pll.pll_enable_set(True)
-    t.pll.pll_outenable_set(False, 0)
     t.pll.pll_outenable_set(True, 1)
-    t.pll.pll_outenable_set(False, 2)
-    t.pll.pll_outfreq_set(7.37E6, 1)  # Typical lab clock; adjust as needed
-
-    t.clkusbautooff = True
-    t.clksleeptime = 1
-
-    # --- AES core initialization ---
-    REG_DUT_RESET = 0x07
-    # For AES-128 (16 bytes), many CW305 designs expect BYTECNT_SIZE = 7 (log2(128))
+    t.pll.pll_outfreq_set(7.37E6, 1)
     t.bytecount_size = 7
-
-    # Pulse reset
-    t.fpga_write(REG_DUT_RESET, b"\x01")
-    time.sleep(0.001)
-    t.fpga_write(REG_DUT_RESET, b"\x00")
-    # --------------------------------
-
+    # Toggle a register to place the target in a known state
+    t.fpga_write(0x07, b"\x01")
+    time.sleep(0.01)
+    t.fpga_write(0x07, b"\x00")
+    print("[INFO] CW305 ready.")
     return t
 
-def dut_write_go_wait_read(target: cw.targets.CW305, pt: bytes, key: bytes) -> bytes:
+
+def run_aes(target, pt, key) -> bytes:
+    """Perform a single AES encryption on the target and return the
+    resulting ciphertext bytes.
+
+    The CW305 FPGA interface uses reversed byte order for writes/reads;
+    therefore we reverse the plaintext/key when writing and reverse the
+    ciphertext when reading back.
     """
-    Write plaintext and key to CW305 registers, start computation (GO=1),
-    wait until done (GO clears to 0), read ciphertext.
-    Assumes the bitstream asserts a trigger pin during active encryption.
-    """
-    REG_DUT_KEYIN   = 0x08
-    REG_DUT_DATAIN  = 0x09
-    REG_DUT_DATAOUT = 0x0A
-    REG_DUT_GO      = 0x05
+    REG_KEY, REG_PT, REG_CT, REG_GO = 0x08, 0x09, 0x0A, 0x05
+    # Helper functions to reverse byte order for the FPGA interface
+    wr = lambda x: bytearray(x[::-1])
+    rd = lambda x: bytes(x[::-1])
 
-    def fmt_wr(x: bytes) -> bytearray:
-        return bytearray(x[::-1])  # CW305 registers are little-endian addressed
-    def fmt_rd(x: bytearray) -> bytes:
-        return bytes(x[::-1])
+    # Write plaintext and key, then pulse GO
+    target.fpga_write(REG_PT, wr(pt))
+    target.fpga_write(REG_KEY, wr(key))
+    target.fpga_write(REG_GO, b"\x01")
 
-    # Write inputs
-    target.fpga_write(REG_DUT_DATAIN, fmt_wr(pt))
-    target.fpga_write(REG_DUT_KEYIN,  fmt_wr(key))
-
-    # Start the AES engine: set GO = 1
-    target.fpga_write(REG_DUT_GO, b"\x01")
-
-    # Wait until done: GO returns to 0
-    tries = 0
-    while target.fpga_read(REG_DUT_GO, 1)[0] == 0x01:
+    # Wait for the hardware to clear GO (device sets GO=1 while busy)
+    while target.fpga_read(REG_GO, 1)[0] == 0x01:
         time.sleep(0.0005)
-        tries += 1
-        if tries > 20000:
-            # Helpful debug print before raising
-            print(f"[ERROR] AES core timeout. PT={pt.hex()} KEY={key.hex()}")
-            raise RuntimeError("AES core timeout on CW305")
 
-    # Read ciphertext
-    ct = fmt_rd(target.fpga_read(REG_DUT_DATAOUT, 16))
-    return ct
+    return rd(target.fpga_read(REG_CT, 16))
 
-# =========================
-# Main capture routine
-# =========================
+# ----------------------------
+# Main capture loop
+# ----------------------------
 
 def main():
-    total_segments = int(N_TRACES) * max(1, int(AVERAGE_OVER))
+    """Run the capture session.
+
+    Steps:
+    1. Ensure output directory exists.
+    2. Connect to scope and target and configure both.
+    3. For each plaintext: clear+arm the scope, start AES on FPGA, wait and
+       read the trace, store waveform and metadata.
+    4. Save to a compressed .npz file.
+    """
     os.makedirs(os.path.dirname(SAVE_PATH), exist_ok=True)
 
-    rm = None
-    rigol = None
+    scope = RigolScope(visa_resource=RIGOL_VISA_FORCE)
     cw305 = None
-
     try:
-        # Configure and arm the Rigol first (so it's ready before first encryption)
-        rm, rigol = setup_rigol_segmode(total_segments, visa_override=RIGOL_VISA_FORCE)
+        # Connect and configure devices
+        scope.connect()
+        scope.setup_for_single_trace()
+        cw305 = setup_cw305()
 
-        # Standalone CW305 setup
-        cw305 = setup_cw305_standalone()
-
-        # Allow the Rigol to fully arm
-        print("[INFO] Waiting for Rigol to arm...")
-        time.sleep(SCOPE_ARM_DELAY)
-
-        # Fixed key for all traces
         key = bytes.fromhex(FIXED_KEY_HEX)
-
-        # Generate plaintexts (one per logical trace)
         pts = make_plaintexts(N_TRACES)
+        traces = []
+        metadata = []
 
-        metas: list[TraceMeta] = []
-        seg_count = 0
+        for i, pt in enumerate(pts):
+            # Clear previous acquisition and arm the scope. The function
+            # will retry internally up to SCOPE_ARM_RETRIES times.
+            armed = scope.clear_and_arm(delay_after_sing=SCOPE_ARM_DELAY)
+            if not armed:
+                print(f"[WARN] Trace {i+1}: scope did not report armed within {SCOPE_ARM_TIMEOUT}s; retrying...")
+                armed = scope.clear_and_arm(delay_after_sing=SCOPE_ARM_DELAY)
 
-        # Drive exactly total_segments encryptions (grouped for averaging if requested)
-        print(f"[INFO] Starting capture of {N_TRACES} logical traces ({total_segments} segments total).")
-        for i_pt, pt in enumerate(pts, start=1):
-            last_ct = None
-            for _ in range(max(1, AVERAGE_OVER)):
-                seg_count += 1
-                # Write inputs and start AES on CW305 (assumes trigger pin toggles during encryption)
-                last_ct = dut_write_go_wait_read(cw305, pt, key)
-                # Optional small delay to help scope re-arm
+            if not armed:
+                msg = f"Scope failed to arm for trace {i+1} after {SCOPE_ARM_RETRIES} attempts."
+                if SKIP_ON_ARM_FAIL:
+                    print("[WARN] " + msg + " Skipping this trace and continuing.")
+                    # Skip this trace but keep loop running
+                    continue
+                else:
+                    raise RuntimeError(msg + " Aborting.")
+
+            # Scope is confirmed armed/waiting for trigger. Start AES on FPGA.
+            ct = run_aes(cw305, pt, key)
+
+            # Wait for scope to complete acquisition and collect waveform
+            scope.wait_for_trace()
+            if POST_TRIGGER_DELAY:
                 time.sleep(POST_TRIGGER_DELAY)
-                if (seg_count % 100) == 0 or seg_count == total_segments:
-                    print(f"[INFO] Triggered {seg_count}/{total_segments} segments")
-            metas.append(TraceMeta(pt=pt, key=key, ct=last_ct))
 
-        # Wait until the Rigol confirms segmented acquisition is complete (synchronization)
-        try:
-            print("[INFO] Waiting for instrument operations to complete...")
-            rigol.query("*OPC?")
-        except Exception:
-            # Non-fatal; will attempt to read segments anyway
-            print("[WARN] *OPC? query failed; continuing to read segments.")
+            try:
+                trace = scope.read_single_trace()
+            except Exception as e:
+                print(f"[ERROR] Failed to read trace {i+1}: {e}")
+                if SKIP_ON_ARM_FAIL:
+                    print("[WARN] Skipping this trace due to read error.")
+                    continue
+                else:
+                    raise
 
-        # Stop acquisition to allow waveform readout
-        try:
-            rigol.write(":STOP")
-        except Exception:
-            print("[WARN] Failed to send :STOP to Rigol; continuing anyway.")
+            traces.append(trace)
+            metadata.append(TraceMeta(pt=pt, key=key, ct=ct))
 
-        # Debug: print configured segment count and points per segment
-        try:
-            segcount_report = rigol.query(":ACQ:SEGM:COUN?")
-            print(f"[DEBUG] Rigol configured segment count: {segcount_report}")
-        except Exception:
-            pass
-        try:
-            wpoints = rigol.query(":WAV:POIN?")
-            print(f"[DEBUG] Rigol reports WAV:POIN? = {wpoints}")
-        except Exception:
-            pass
+            if (i+1) % 100 == 0:
+                print(f"[INFO] Captured {i+1}/{N_TRACES} traces")
 
-        print("[INFO] Acquisition complete. Reading segments from Rigol...")
+        # Convert lists to numpy arrays and save
+        waves = np.asarray(traces, dtype=np.float32)
+        pts_arr = np.array([list(m.pt) for m in metadata], dtype=np.uint8)
+        keys_arr = np.array([list(m.key) for m in metadata], dtype=np.uint8)
+        cts_arr = np.array([list(m.ct) for m in metadata], dtype=np.uint8)
 
-        # Increase read timeout while we do bulk readback
-        prev_timeout = getattr(rigol, "timeout", 30000)
-        rigol.timeout = max(prev_timeout, RIGOL_READ_TIMEOUT_MS)
-
-        segs = []
-        for idx in range(1, total_segments + 1):
-            seg = rigol_read_segment(rigol, idx)
-            segs.append(seg)
-            if (idx % 100) == 0 or idx == total_segments:
-                print(f"[INFO] Transferred {idx}/{total_segments}")
-
-        # Restore timeout
-        rigol.timeout = prev_timeout
-
-        segs = np.asarray(segs, dtype=np.float32)  # shape: (total_segments, points)
-
-        # Average groups of AVERAGE_OVER, if requested
-        if AVERAGE_OVER > 1:
-            segs = segs.reshape(N_TRACES, AVERAGE_OVER, -1).mean(axis=1)
-
-        # Save results: store plaintexts/keys/ciphertexts as uint8 arrays (N x 16)
-        plaintexts_arr = np.array([list(m.pt) for m in metas], dtype=np.uint8).reshape(-1, 16)
-        keys_arr = np.array([list(m.key) for m in metas], dtype=np.uint8).reshape(-1, 16)
-        ciphertexts_arr = np.array([list(m.ct) for m in metas], dtype=np.uint8).reshape(-1, 16)
+        rigol_meta = {
+            'acq_mode': ACQUISITION_MODE,
+            'hardware_averages': HARDWARE_AVERAGES if ACQUISITION_MODE == 'AVERAGE' else 1,
+            'bandwidth_limit_mhz': BANDWIDTH_LIMIT_MHZ,
+            'points_per_trace': POINTS_PER_TRACE,
+            'time_per_div_s': TIME_PER_DIV,
+            'vertical_scale_v': VERTICAL_SCALE_V,
+            'scope_arm_delay_s': SCOPE_ARM_DELAY,
+            'scope_arm_timeout_s': SCOPE_ARM_TIMEOUT,
+            'scope_arm_retries': SCOPE_ARM_RETRIES,
+        }
 
         np.savez_compressed(
             SAVE_PATH,
-            waves=segs,
-            plaintexts=plaintexts_arr,
+            waves=waves,
+            plaintexts=pts_arr,
             keys=keys_arr,
-            ciphertexts=ciphertexts_arr,
-            rigol=dict(
-                trig_mode=TRIGGER_MODE,
-                meas_ch=MEAS_CH,
-                trig_src=(MEAS_CH if TRIGGER_MODE.lower() == "power" else TRIG_SRC),
-                trig_level_v=(0.01 if TRIGGER_MODE.lower() == "power" else TRIG_LEVEL_V),
-                points_per_segment=POINTS_PER_SEGMENT,
-                time_per_div=TIME_PER_DIV,
-                vertical_scale_v=VERTICAL_SCALE_V,
-            ),
-            cw305=dict(bitstream=BITSTREAM),
-            meta=dict(n_traces=N_TRACES, average_over=AVERAGE_OVER),
+            ciphertexts=cts_arr,
+            rigol_config=rigol_meta,
+            target_config={'bitstream': os.path.basename(BITSTREAM)}
         )
-
-        print(f"[OK] Saved {segs.shape[0]} traces to {SAVE_PATH}")
+        print(f"[SUCCESS] Saved {waves.shape[0]} traces to {SAVE_PATH}")
 
     finally:
-        # Close instruments cleanly even on error
-        try:
-            if rigol:
-                rigol.close()
-        except Exception:
-            pass
-        try:
-            if cw305:
+        # Always attempt to cleanly disconnect
+        scope.disconnect()
+        if cw305:
+            try:
                 cw305.dis()
-        except Exception:
-            pass
-        try:
-            if rm:
-                rm.close()
-        except Exception:
-            pass
+            except Exception:
+                pass
 
-# Entry point
 if __name__ == "__main__":
     main()

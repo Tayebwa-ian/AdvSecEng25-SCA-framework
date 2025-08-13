@@ -19,7 +19,7 @@ import matplotlib.pyplot as plt
 # -------------------------
 # User configuration
 # -------------------------
-PATH_IN = "src/py/data/traces_mso5074_1.npz"           # input capture file
+PATH_IN = "src/py/data/traces_mso5074.npz"           # input capture file
 PATH_OUT = "src/py/data/traces_mso5074_preproc.npz"  # output preprocessed file
 
 # Detection / alignment parameters (tune for your traces)
