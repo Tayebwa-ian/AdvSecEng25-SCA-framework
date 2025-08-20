@@ -42,7 +42,7 @@ N_TRACES = 2000
 
 # Acquisition mode: 'AVERAGE' (hardware averages), 'HRES' (high-res), or
 # 'NORMAL' (single-shot). AVERAGE will use HARDWARE_AVERAGES.
-ACQUISITION_MODE: Literal['AVERAGE', 'HRES', 'NORMAL'] = 'AVERAGE'
+ACQUISITION_MODE: Literal['AVERAGE', 'HRES', 'NORMAL'] = 'HRES'
 HARDWARE_AVERAGES = 16
 
 # Bandwidth limit in MHz, or None to leave bandwidth off
@@ -54,17 +54,17 @@ MEAS_CH = "CHAN1"         # analog channel to record
 TRIG_SRC = "CHAN2"        # trigger source (digital input or channel)
 
 # Vertical/time settings for the analog channel we're recording
-VERTICAL_SCALE_V = 0.05
+VERTICAL_SCALE_V = 0.01
 TIME_PER_DIV = 2e-6
 TRIG_LEVEL_V = 1.5
-POINTS_PER_TRACE = 500
+POINTS_PER_TRACE = 10000
 
 # Force a specific VISA resource (e.g. 'USB0::0x1AB1::0x0588::DS1ZA170600000::INSTR')
 RIGOL_VISA_FORCE = None
 
 # FPGA bitstream and output save path
 BITSTREAM = r"C:\Users\Admin\Desktop\Security\advseceng25-sca-framework\out\cw305.bit"
-SAVE_PATH = r"C:\Users\Admin\Desktop\Security\advseceng25-sca-framework\src\py\data\traces_mso5074_1.npz"
+SAVE_PATH = r"C:\Users\Admin\Desktop\Security\advseceng25-sca-framework\src\py\data\traces_mso5074.npz"
 FIXED_KEY_HEX = "10A58869D74BE5A374CF867CFB473859"
 
 # ----------------------------
